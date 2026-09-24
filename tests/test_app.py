@@ -1,0 +1,204 @@
+"""Exercise the UI-to-worker boundary without requiring a connected camera."""
+
+import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import unittest
+from datetime import datetime
+
+import numpy as np
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QApplication
+
+from app import MainWindow
+from camera import Frame
+
+
+class FakeWorker(QObject):
+    connected = Signal(dict)
+    settings_changed = Signal(dict)
+    error = Signal(str)
+    status = Signal(str)
+    finished = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.stopped = False
+        self.writes = []
+        self.frame = None
+
+    def start(self):
+        self.running = True
+        self.connected.emit({"model": "BFS-U3-51S5C", "serial": "test"})
+
+    def isRunning(self):
+        return self.running
+
+    def stop(self):
+        self.stopped = True
+
+    def finish(self):
+        self.running = False
+        self.finished.emit()
+
+    def set_control(self, key, value):
+        self.writes.append((key, value))
+
+    def latest_frame(self):
+        return self.frame
+
+    def white_balance_once(self):
+        self.writes.append(("white_balance_once", True))
+
+    def exposure_once(self):
+        self.writes.append(("exposure_once", True))
+
+    def gain_once(self):
+        self.writes.append(("gain_once", True))
+
+
+def settings():
+    result = {
+        key: {"value": value, "min": minimum, "max": maximum, "enabled": True}
+        for key, value, minimum, maximum in (
+            ("exposure_us", 20000., 6., 30000000.),
+            ("gain_db", 0., 0., 47.99),
+            ("frame_rate", 15., 1., 75.79),
+            ("wb_red", 1.5, .125, 8.),
+            ("wb_blue", 1.2, .125, 8.),
+        )
+    }
+    result.update(
+        white_balance_once_enabled=True, white_balance_busy=False,
+        exposure_once_enabled=True, exposure_busy=False,
+        gain_once_enabled=True, gain_busy=False,
+    )
+    return result
+
+
+class AppTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        cls.app.setQuitOnLastWindowClosed(False)
+
+    def setUp(self):
+        self.worker = FakeWorker()
+        self.window = MainWindow(worker_factory=lambda: self.worker, auto_connect=False)
+        self.window.show()
+        self.window.connect_camera()
+        self.worker.settings_changed.emit(settings())
+        self.app.processEvents()
+
+    def tearDown(self):
+        if self.worker.running:
+            self.worker.finish()
+        self.window.close()
+        self.app.processEvents()
+
+    def test_exposure_units_and_readback_do_not_echo_writes(self):
+        self.assertEqual(self.window.controls["exposure_us"].spin.value(), 20.)
+        self.assertEqual(self.worker.writes, [])
+        self.window.controls["exposure_us"].spin.setValue(12.5)
+        self.assertEqual(self.worker.writes, [("exposure_us", 12500.)])
+        updated = settings()
+        updated["exposure_us"]["value"] = 12499.
+        self.worker.settings_changed.emit(updated)
+        self.assertEqual(self.window.controls["exposure_us"].spin.value(), 12.499)
+        self.assertEqual(len(self.worker.writes), 1)
+
+    def test_gain_fps_and_white_balance_reach_worker(self):
+        for key, value in (("gain_db", 2.5), ("frame_rate", 20.), ("wb_red", 1.6), ("wb_blue", 1.8)):
+            self.window.controls[key].spin.setValue(value)
+        self.assertEqual(self.worker.writes, [("gain_db", 2.5), ("frame_rate", 20.), ("wb_red", 1.6), ("wb_blue", 1.8)])
+
+    def test_white_balance_once_uses_camera_capability(self):
+        data = settings()
+        data["white_balance_once_enabled"] = False
+        self.worker.settings_changed.emit(data)
+        self.assertFalse(self.window.balance_button.isEnabled())
+        self.worker.settings_changed.emit(settings())
+        self.window.balance_button.click()
+        self.assertEqual(self.worker.writes, [("white_balance_once", True)])
+        self.assertFalse(self.window.balance_button.isEnabled())
+
+    def test_auto_buttons_request_selected_parameter_and_show_final_readback(self):
+        for key, prefix, chosen, displayed in (
+            ("exposure_us", "exposure", 43210., 43.21),
+            ("gain_db", "gain", 6.25, 6.25),
+        ):
+            with self.subTest(control=key):
+                button = self.window.auto_buttons[key]
+                button.click()
+                self.assertEqual(self.worker.writes[-1], (f"{prefix}_once", True))
+                self.assertFalse(button.isEnabled())
+                self.assertFalse(self.window.controls[key].spin.isEnabled())
+                data = settings()
+                data[f"{prefix}_busy"] = True
+                data[f"{prefix}_once_enabled"] = False
+                data[key].update(value=chosen, enabled=False)
+                self.worker.settings_changed.emit(data)
+                self.assertEqual(button.text(), "Adjusting…")
+                self.assertEqual(self.window.controls[key].spin.value(), displayed)
+                data[f"{prefix}_busy"] = False
+                data[f"{prefix}_once_enabled"] = True
+                data[key]["enabled"] = True
+                self.worker.settings_changed.emit(data)
+                self.assertEqual(button.text(), "Auto")
+                self.assertTrue(button.isEnabled())
+                self.assertTrue(self.window.controls[key].spin.isEnabled())
+        self.assertEqual(self.worker.writes, [("exposure_once", True), ("gain_once", True)])
+
+    def test_auto_unsupported_and_disconnect_disable_buttons(self):
+        data = settings()
+        data["exposure_once_enabled"] = False
+        self.worker.settings_changed.emit(data)
+        self.assertFalse(self.window.auto_buttons["exposure_us"].isEnabled())
+        self.assertTrue(self.window.auto_buttons["gain_db"].isEnabled())
+        self.window.toggle_connection()
+        self.worker.settings_changed.emit(settings())
+        self.assertTrue(all(not b.isEnabled() for b in self.window.auto_buttons.values()))
+
+    def test_auto_readbacks_do_not_erase_edit_in_another_control(self):
+        gain = self.window.controls["gain_db"].spin
+        gain.lineEdit().setText("7.5 dB")
+        data = settings()
+        data["exposure_busy"] = True
+        data["exposure_us"].update(value=31000., enabled=False)
+        self.worker.settings_changed.emit(data)
+        self.assertEqual(gain.lineEdit().text(), "7.5 dB")
+
+    def test_preview_keeps_full_resolution_frame_and_offline_label(self):
+        rgb = np.full((48, 65, 3), (15, 90, 200), dtype=np.uint8)
+        rgb.setflags(write=False)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 19.8)
+        self.window._update_preview()
+        self.assertTrue(self.window.save_button.isEnabled())
+        self.assertIs(self.window._frame.rgb, rgb)
+        self.assertEqual(self.window.preview._image.width(), 65)
+        self.assertIn("19.8 fps", self.window.frame_label.text())
+        self.worker.finish()
+        self.assertEqual(self.window.live_badge.text(), "LAST FRAME")
+        self.assertTrue(self.window.save_button.isEnabled())
+
+    def test_close_waits_for_worker_and_ignores_late_settings(self):
+        self.window.close()
+        self.assertTrue(self.worker.stopped)
+        self.assertTrue(self.window.isVisible())
+        self.worker.settings_changed.emit(settings())
+        self.assertFalse(self.window.controls["gain_db"].spin.isEnabled())
+        self.worker.finish()
+        self.app.processEvents()
+        self.assertFalse(self.window.isVisible())
+
+    def test_error_allows_reconnect_after_worker_finishes(self):
+        self.worker.error.emit("Camera unplugged")
+        self.worker.finish()
+        self.assertEqual(self.window.error_banner.text(), "Camera unplugged")
+        self.assertTrue(self.window.connection_button.isEnabled())
+        self.assertFalse(self.window.controls["gain_db"].spin.isEnabled())
+
+
+if __name__ == "__main__":
+    unittest.main()

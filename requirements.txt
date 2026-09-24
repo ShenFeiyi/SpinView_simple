@@ -1,0 +1,4 @@
+# Install the matching vendor PySpin wheel first; it is bundled with Spinnaker.
+spinnaker-python==4.4.0.246
+numpy==2.5.3
+PySide6==6.11.2
