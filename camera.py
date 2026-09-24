@@ -122,20 +122,23 @@ class CameraWorker(QThread):
         node_map = self._stream_nodes if stream else self._nodes
         return casts[kind](node_map.GetNode(name))
 
-    def _read(self, name, kind="float", stream=False):
+    def _read(self, name, kind="float", stream=False, *, fresh=False):
         try:
             node = self._node(name, kind, stream)
             if not self._spin.IsReadable(node):
                 return None
+            # Automatic controls change on the camera without a host write.
+            # GenICam can otherwise keep returning cached Once/value entries
+            # until we stop acquisition, hiding completion from the UI.
             if kind == "enum":
-                return node.GetCurrentEntry().GetSymbolic()
-            return node.GetValue()
+                return node.GetCurrentEntry(False, fresh).GetSymbolic()
+            return node.GetValue(False, fresh)
         except self._spin.SpinnakerException:
             return None
 
     def _write(self, name, value, kind="float", stream=False, *, force=False):
         node = self._node(name, kind, stream)
-        current = self._read(name, kind, stream)
+        current = self._read(name, kind, stream, fresh=True)
         if current == value and not force:
             return
         if not self._spin.IsWritable(node):
@@ -151,7 +154,7 @@ class CameraWorker(QThread):
             node.SetValue(value)
 
     def _remember(self, name, kind="float", stream=False):
-        value = self._read(name, kind, stream)
+        value = self._read(name, kind, stream, fresh=True)
         if value is not None:
             self._original[name] = (kind, value, stream)
 
@@ -173,7 +176,7 @@ class CameraWorker(QThread):
         for key, selector in (("wb_red", "Red"), ("wb_blue", "Blue")):
             try:
                 self._write("BalanceRatioSelector", selector, "enum")
-                self._original[key] = self._read("BalanceRatio")
+                self._original[key] = self._read("BalanceRatio", fresh=True)
             except (self._spin.SpinnakerException, RuntimeError):
                 pass
 
@@ -208,7 +211,7 @@ class CameraWorker(QThread):
             if not self._spin.IsReadable(node):
                 raise RuntimeError("Not available on this camera")
             enabled = self._spin.IsWritable(node)
-            result = {"value": float(node.GetValue()), "min": float(node.GetMin()),
+            result = {"value": float(node.GetValue(False, True)), "min": float(node.GetMin()),
                       "max": float(node.GetMax()), "enabled": enabled}
             if not enabled:
                 result["reason"] = "Camera currently locks this control"
@@ -237,7 +240,7 @@ class CameraWorker(QThread):
         if previous:
             self._write("BalanceRatioSelector", previous, "enum")
         # Additional metadata is useful for explaining an exposure-limited rate.
-        settings["resulting_frame_rate"] = self._read("AcquisitionResultingFrameRate")
+        settings["resulting_frame_rate"] = self._read("AcquisitionResultingFrameRate", fresh=True)
         settings["white_balance_busy"] = self._wb_deadline is not None
         settings["white_balance_once_enabled"] = self._wb_once_available()
         for kind, (name, _) in self.AUTO_CONTROLS.items():
@@ -285,7 +288,7 @@ class CameraWorker(QThread):
         except (self._spin.SpinnakerException, RuntimeError):
             self._cancel_auto(kind)
             raise
-        exposure_s = float(self._read("ExposureTime") or 0) / 1e6
+        exposure_s = float(self._read("ExposureTime", fresh=True) or 0) / 1e6
         if kind == "exposure":
             upper_s = float(self._read("AutoExposureExposureTimeUpperLimit") or 0) / 1e6
             exposure_s = max(exposure_s, upper_s)
@@ -304,10 +307,10 @@ class CameraWorker(QThread):
         settings = {key: value.copy() if isinstance(value, dict) else value
                     for key, value in self._settings.items()}
         for control in ("exposure_us", "gain_db", "frame_rate"):
-            value = self._read(self.CONTROL_NODES[control])
+            value = self._read(self.CONTROL_NODES[control], fresh=True)
             if value is not None:
                 settings[control]["value"] = float(value)
-        settings["resulting_frame_rate"] = self._read("AcquisitionResultingFrameRate")
+        settings["resulting_frame_rate"] = self._read("AcquisitionResultingFrameRate", fresh=True)
         self._auto_metadata(settings)
         self._settings = settings
         self.settings_changed.emit(settings)
@@ -317,7 +320,7 @@ class CameraWorker(QThread):
             return
         self._next_auto_poll = now + 0.25
         for kind, deadline in list(self._auto_deadlines.items()):
-            mode = self._read(self.AUTO_CONTROLS[kind][0], "enum")
+            mode = self._read(self.AUTO_CONTROLS[kind][0], "enum", fresh=True)
             finished, expired, unavailable = mode == "Off", now >= deadline, mode is None
             if finished or expired or unavailable:
                 # One transition at completion, not a stop/restart on every
@@ -371,7 +374,7 @@ class CameraWorker(QThread):
                     self._start_auto(key.removesuffix("_once"))
                 elif key == "white_balance_once":
                     self._write("BalanceWhiteAuto", "Once", "enum")
-                    exposure_s = float(self._read("ExposureTime") or 0) / 1e6
+                    exposure_s = float(self._read("ExposureTime", fresh=True) or 0) / 1e6
                     rate = float(self._read("AcquisitionFrameRate") or 1)
                     self._wb_deadline = time.monotonic() + max(12.0, 15 * max(exposure_s, 1 / rate))
                     self.status.emit("Adjusting white balance…")
@@ -380,7 +383,7 @@ class CameraWorker(QThread):
                         if key == control:
                             self._cancel_auto(kind)
                     if key.startswith("wb_"):
-                        self._write("BalanceWhiteAuto", "Off", "enum")
+                        self._write("BalanceWhiteAuto", "Off", "enum", force=True)
                         self._wb_deadline = None
                         self._write("BalanceRatioSelector", "Red" if key == "wb_red" else "Blue", "enum")
                     self._write(self.CONTROL_NODES[key], value)
@@ -395,11 +398,11 @@ class CameraWorker(QThread):
         if self._wb_deadline is None or now < self._next_wb_poll:
             return
         self._next_wb_poll = now + 0.25
-        finished = self._read("BalanceWhiteAuto", "enum") == "Off"
+        finished = self._read("BalanceWhiteAuto", "enum", fresh=True) == "Off"
         expired = now >= self._wb_deadline
         if finished or expired:
             self._end()
-            self._write("BalanceWhiteAuto", "Off", "enum")
+            self._write("BalanceWhiteAuto", "Off", "enum", force=True)
             self._wb_deadline = None
             self._refresh_settings()
             self.status.emit("White balance adjusted" if finished else "White balance stopped; try again with a neutral, well-lit target")

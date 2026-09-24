@@ -89,6 +89,82 @@ class CameraWorkerTests(unittest.TestCase):
         worker._refresh_settings()
         return worker, values
 
+    def use_cached_sdk_reads(self, worker, values):
+        """SDK cache stays stale when the device adjusts its own controls."""
+        cached = values.copy()
+
+        def node(name, kind="float", stream=False):
+            result = Mock()
+            result.GetValue.side_effect = lambda Verify=False, IgnoreCache=False: (
+                values.get(name) if IgnoreCache else cached.get(name))
+            result.GetCurrentEntry.side_effect = lambda Verify=False, IgnoreCache=False: (
+                SimpleNamespace(GetSymbolic=lambda: (
+                    values.get(name) if IgnoreCache else cached.get(name))))
+            result.GetMin.return_value = 0.0
+            result.GetMax.return_value = 30_000_000.0
+            return result
+
+        worker._node = node
+        worker._spin.IsReadable = lambda node: True
+        worker._spin.IsWritable = lambda node: True
+        worker._read = CameraWorker._read.__get__(worker, CameraWorker)
+        worker._float_setting = CameraWorker._float_setting.__get__(worker, CameraWorker)
+
+    def test_device_completion_bypasses_stale_once_and_value_caches(self):
+        for kind, node, control, chosen in (
+            ("exposure", "ExposureTime", "exposure_us", 15_004.0),
+            ("gain", "Gain", "gain_db", 8.0),
+        ):
+            with self.subTest(kind=kind):
+                worker, values = self.auto_worker()
+                getattr(worker, f"{kind}_once")()
+                worker._apply_commands()
+                self.use_cached_sdk_reads(worker, values)
+                values[node] = chosen
+                values[worker.AUTO_CONTROLS[kind][0]] = "Off"
+                now = time.monotonic()
+                self.assertLess(now, worker._auto_deadlines[kind])
+                worker._poll_auto_controls(now)
+                self.assertFalse(worker._settings[f"{kind}_busy"])
+                self.assertTrue(worker._settings[control]["enabled"])
+                self.assertEqual(worker._settings[control]["value"], chosen)
+
+    def test_auto_live_readbacks_bypass_stale_float_cache_without_pausing(self):
+        worker, values = self.auto_worker()
+        worker.exposure_once()
+        worker._apply_commands()
+        self.use_cached_sdk_reads(worker, values)
+        values.update(ExposureTime=24_000.0, AcquisitionResultingFrameRate=18.0)
+        worker._end.reset_mock()
+        worker._begin.reset_mock()
+        worker._poll_auto_controls(time.monotonic())
+        self.assertTrue(worker._settings["exposure_busy"])
+        self.assertEqual(worker._settings["exposure_us"]["value"], 24_000.0)
+        self.assertEqual(worker._settings["resulting_frame_rate"], 18.0)
+        worker._end.assert_not_called()
+        worker._begin.assert_not_called()
+
+    def test_white_balance_completion_bypasses_cache_and_unlocks_manual(self):
+        worker, values = self.auto_worker()
+        values["BalanceWhiteAuto"] = "Once"
+        worker._wb_deadline = time.monotonic() + 15
+        self.use_cached_sdk_reads(worker, values)
+        values.update(BalanceWhiteAuto="Off", BalanceRatio=1.5)
+        worker._poll_white_balance(time.monotonic())
+        self.assertFalse(worker._settings["white_balance_busy"])
+        self.assertEqual(worker._settings["wb_red"]["value"], 1.5)
+        worker._write.assert_any_call("BalanceWhiteAuto", "Off", "enum", force=True)
+
+    def test_manual_write_is_not_skipped_when_only_cached_value_matches(self):
+        worker, values = self.auto_worker()
+        self.use_cached_sdk_reads(worker, values)
+        values["ExposureTime"] = 15_004.0
+        node = worker._node("ExposureTime")
+        worker._node = lambda *args, **kwargs: node
+        worker._write = CameraWorker._write.__get__(worker, CameraWorker)
+        worker._write("ExposureTime", 10_000.0)
+        node.SetValue.assert_called_once_with(10_000.0)
+
     def test_auto_readbacks_do_not_restart_stream_or_change_cached_limits(self):
         worker, values = self.auto_worker()
         worker.exposure_once()

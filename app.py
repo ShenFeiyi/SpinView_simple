@@ -6,12 +6,14 @@ from pathlib import Path
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt
 from PySide6.QtGui import QAction, QImage, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QApplication, QCheckBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QVBoxLayout, QWidget,
 )
 
 from camera import CameraWorker
+from analysis_panel import AnalysisPanel
+from image_analysis import AnalysisWorker
 from image_io import IMAGE_FILTERS, save_rgb_image
 from preview import PreviewWidget
 
@@ -30,6 +32,7 @@ QPushButton { color: #344256; background: white; border: 1px solid #d7dee7;
               border-radius: 7px; padding: 9px 15px; font-weight: 500; }
 QPushButton:hover { background: #edf2f7; border-color: #bbc8d7; }
 QPushButton:pressed { background: #e1e8f1; }
+QPushButton:checked { background: #e8f0fc; border-color: #9ebbe6; color: #195fc5; }
 QPushButton:disabled { color: #99a5b3; background: #f1f3f6; border-color: #e1e6ed; }
 QPushButton#primary { color: white; background: #216cdb; border-color: #216cdb; }
 QPushButton#primary:hover { background: #195fc5; }
@@ -39,11 +42,13 @@ QGroupBox { background: white; border: 1px solid #dfe5ed; border-radius: 10px;
             margin-top: 15px; padding: 16px 14px 14px; font-weight: 600; }
 QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 5px;
                    color: #34465d; }
-QDoubleSpinBox { background: #f8fafc; color: #24364e; border: 1px solid #d8e0eb;
+QDoubleSpinBox, QSpinBox, QComboBox { background: #f8fafc; color: #24364e; border: 1px solid #d8e0eb;
                  border-radius: 6px; padding: 7px 10px; min-height: 20px;
                  selection-background-color: #216cdb; }
-QDoubleSpinBox:focus { border: 1px solid #216cdb; }
-QDoubleSpinBox:disabled { color: #9ba5b2; background: #f2f4f7; }
+QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #216cdb; }
+QDoubleSpinBox:disabled, QSpinBox:disabled { color: #9ba5b2; background: #f2f4f7; }
+QDockWidget { color: #34465d; font-weight: 600; }
+QDockWidget::title { background: #edf1f6; padding: 5px 12px; }
 QCheckBox { color: #35455a; spacing: 8px; }
 QScrollArea { background: transparent; border: none; }
 QWidget#controlsPanel { background: transparent; }
@@ -93,11 +98,18 @@ class MainWindow(QMainWindow):
         self._last_sequence = -1
         self._closing = False
         self._stopping = False
+        self._analysis_generation = 0
+        self._analysis_request = None
+        self._analysis_sequence = -1
+        self._analysis_worker = AnalysisWorker(self)
+        self._analysis_worker.result_ready.connect(self._on_analysis_result)
+        self._analysis_worker.error.connect(self._on_analysis_error)
+        self._analysis_worker.finished.connect(self._on_analysis_finished)
         self._last_directory = Path.home() / "Pictures"
         if not self._last_directory.exists():
             self._last_directory = Path.home()
         self.setWindowTitle("SpinView Simple")
-        self.resize(1240, 850)
+        self.resize(1240, 940)
         self.setMinimumSize(880, 650)
         self._build_ui()
         self.setStyleSheet(STYLE)
@@ -105,6 +117,10 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._update_preview)
         self._timer.start()
+        self._analysis_timer = QTimer(self)
+        self._analysis_timer.setInterval(200)
+        self._analysis_timer.timeout.connect(self._request_analysis)
+        self._analysis_timer.start()
         if auto_connect:
             QTimer.singleShot(0, self.connect_camera)
 
@@ -127,6 +143,11 @@ class MainWindow(QMainWindow):
         heading.addWidget(self.camera_label)
         header.addLayout(heading)
         header.addStretch()
+        self.analysis_button = QPushButton("Histogram && profile")
+        self.analysis_button.setToolTip("Show full-image RGB histogram and selectable row/column profiles")
+        self.analysis_button.setCheckable(True)
+        self.analysis_button.setChecked(True)
+        header.addWidget(self.analysis_button)
         self.connection_button = QPushButton("Connect camera")
         self.connection_button.clicked.connect(self.toggle_connection)
         self.save_button = QPushButton("Save image…")
@@ -258,6 +279,20 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        self.analysis_panel = AnalysisPanel()
+        self.analysis_dock = QDockWidget("Image analysis", self)
+        self.analysis_dock.setObjectName("imageAnalysisDock")
+        self.analysis_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.analysis_dock.setWidget(self.analysis_panel)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.analysis_dock)
+        self.analysis_button.toggled.connect(self.analysis_dock.setVisible)
+        self.analysis_dock.visibilityChanged.connect(self._analysis_visibility_changed)
+        self.analysis_panel.selection_changed.connect(self._analysis_selection_changed)
+        self.analysis_panel.orientation_changed.connect(self._analysis_orientation_changed)
+        self.preview.pixel_selected.connect(self._select_profile_pixel)
+        view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction(self.analysis_dock.toggleViewAction())
+
     def toggle_connection(self):
         if self._worker is not None and self._worker.isRunning():
             self._stopping = True
@@ -276,6 +311,11 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._frame = None
         self._last_sequence = -1
+        self._analysis_generation += 1
+        self._analysis_request = None
+        self._analysis_sequence = -1
+        self.analysis_panel.clear()
+        self.analysis_panel.set_live(False)
         self.preview.clear("Connecting to camera…")
         self.save_button.setEnabled(False)
         self.connection_button.setEnabled(False)
@@ -366,11 +406,74 @@ class MainWindow(QMainWindow):
         height, width, _ = rgb.shape
         image = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888)
         self.preview.set_image(image)
+        self.analysis_panel.set_image_size(width, height)
+        self.analysis_panel.set_live(True)
+        self._update_profile_guide()
         self.live_badge.setText("● LIVE")
         self.frame_label.setText(
             f"{width:,} × {height:,} px  ·  RGB 8-bit  ·  {frame.fps:.1f} fps received  ·  Preview up to 30 fps"
         )
         self.save_button.setEnabled(True)
+
+    def _update_profile_guide(self):
+        self.preview.set_profile_selection(
+            self.analysis_panel.row, self.analysis_panel.column,
+            self.analysis_panel.orientation,
+            enabled=self.analysis_dock.isVisible() and self._frame is not None,
+        )
+
+    def _analysis_visibility_changed(self, visible):
+        blocker = QSignalBlocker(self.analysis_button)
+        self.analysis_button.setChecked(visible)
+        del blocker
+        self._update_profile_guide()
+        if visible:
+            self._request_analysis()
+
+    def _analysis_selection_changed(self, row, column):
+        self._update_profile_guide()
+        # The 5 Hz timer picks up the latest selection, so dragging does not
+        # queue a full-image histogram for every mouse movement.
+
+    def _analysis_orientation_changed(self, orientation):
+        self._update_profile_guide()
+
+    def _select_profile_pixel(self, column, row):
+        self.analysis_panel.set_selection(row, column)
+
+    def _request_analysis(self):
+        frame = self._frame
+        if self._closing or frame is None or not self.analysis_dock.isVisible():
+            return
+        row, column = self.analysis_panel.row, self.analysis_panel.column
+        request = (self._analysis_generation, frame.sequence, row, column)
+        if request == self._analysis_request:
+            return
+        self._analysis_request = request
+        if not self._analysis_worker.isRunning():
+            self._analysis_worker.start()
+        self._analysis_worker.submit(frame, row, column, generation=self._analysis_generation)
+
+    def _on_analysis_result(self, result):
+        try:
+            if (self._closing or self._frame is None or
+                    result.generation != self._analysis_generation or
+                    result.sequence < self._analysis_sequence or
+                    result.row != self.analysis_panel.row or
+                    result.column != self.analysis_panel.column):
+                return
+            self._analysis_sequence = result.sequence
+            self.analysis_panel.set_result(result)
+        finally:
+            self._analysis_worker.acknowledge_result(result.sequence)
+
+    def _on_analysis_error(self, message):
+        if not self._closing:
+            self.status_label.setText(f"Image analysis: {message}")
+
+    def _on_analysis_finished(self):
+        if self._closing:
+            QTimer.singleShot(0, self.close)
 
     def _on_error(self, message):
         self.error_banner.setText(message)
@@ -397,6 +500,7 @@ class MainWindow(QMainWindow):
         self.connection_button.setEnabled(True)
         self.connection_button.setText("Connect camera")
         self.live_badge.setText("OFFLINE")
+        self.analysis_panel.set_live(False)
         if self._frame is None:
             self.preview.clear("Camera unavailable\n\nConnect a USB 3 camera, close SpinView, and click Connect camera.")
         else:
@@ -435,14 +539,18 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Saved {Path(saved).name} · {frame.rgb.shape[1]} × {frame.rgb.shape[0]} · {Path(saved).parent}")
 
     def closeEvent(self, event):
-        if self._worker is not None and self._worker.isRunning():
-            self._closing = True
+        self._closing = True
+        self._analysis_timer.stop()
+        self._analysis_worker.stop()
+        camera_running = self._worker is not None and self._worker.isRunning()
+        if camera_running or self._analysis_worker.isRunning():
             self._stopping = True
             self.connection_button.setEnabled(False)
             self.save_button.setEnabled(False)
             self._disable_controls()
             self.status_label.setText("Closing the camera and restoring its previous settings…")
-            self._worker.stop()
+            if camera_running:
+                self._worker.stop()
             event.ignore()
         else:
             self._timer.stop()

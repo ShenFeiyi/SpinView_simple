@@ -4,10 +4,12 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import unittest
+import time
 from datetime import datetime
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app import MainWindow
@@ -95,7 +97,50 @@ class AppTests(unittest.TestCase):
         if self.worker.running:
             self.worker.finish()
         self.window.close()
+        self.window._analysis_worker.wait(2000)
         self.app.processEvents()
+
+    def wait_for_analysis(self, row, column):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            result = self.window.analysis_panel._result
+            if result is not None and (result.row, result.column) == (row, column):
+                return result
+            QTest.qWait(5)
+        self.fail("Image analysis did not arrive")
+
+    def test_profiles_follow_preview_selection_and_remain_available_offline(self):
+        rgb = np.arange(4 * 7 * 3, dtype=np.uint8).reshape(4, 7, 3)
+        rgb.setflags(write=False)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        self.window.preview.pixel_selected.emit(6, 3)
+        result = self.wait_for_analysis(3, 6)
+        np.testing.assert_array_equal(result.horizontal, rgb[3])
+        np.testing.assert_array_equal(result.vertical, rgb[:, 6])
+        np.testing.assert_array_equal(result.histogram.sum(axis=1), [28, 28, 28])
+        self.assertEqual(self.worker.writes, [])
+        self.worker.finish()
+        self.window.analysis_panel.set_selection(0, 0)
+        result = self.wait_for_analysis(0, 0)
+        np.testing.assert_array_equal(result.horizontal, rgb[0])
+        self.assertEqual(self.window.live_badge.text(), "LAST FRAME")
+        self.window.analysis_button.click()
+        self.assertFalse(self.window.analysis_dock.isVisible())
+        self.window.analysis_button.click()
+        self.assertTrue(self.window.analysis_dock.isVisible())
+
+    def test_reconnect_clears_analysis_and_rejects_previous_camera_result(self):
+        rgb = np.full((4, 7, 3), 42, dtype=np.uint8)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        result = self.wait_for_analysis(self.window.analysis_panel.row, self.window.analysis_panel.column)
+        self.worker.finish()
+        self.worker.frame = None
+        self.window.connect_camera()
+        self.window._on_analysis_result(result)
+        self.assertIsNone(self.window.analysis_panel._result)
 
     def test_exposure_units_and_readback_do_not_echo_writes(self):
         self.assertEqual(self.window.controls["exposure_us"].spin.value(), 20.)
