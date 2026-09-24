@@ -4,11 +4,11 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt
-from PySide6.QtGui import QAction, QImage, QKeySequence
+from PySide6.QtGui import QAction, QImage, QKeySequence, QPainter
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDockWidget, QDoubleSpinBox, QFileDialog, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 from camera import CameraWorker
@@ -25,6 +25,7 @@ QLabel { color: #263345; background: transparent; }
 QLabel#title { font-size: 24px; font-weight: 700; color: #172436; }
 QLabel#subtitle, QLabel#hint { color: #657387; }
 QLabel#hint { font-size: 11px; }
+QLabel#pixelReadout { color: #34465d; font-size: 11px; font-family: 'Menlo', monospace; }
 QLabel#sectionTitle { font-size: 11px; font-weight: 700; color: #718095; }
 QLabel#liveBadge { color: #197e68; background: #e1f1eb; border-radius: 10px;
                    padding: 5px 10px; font-size: 11px; font-weight: 600; }
@@ -38,6 +39,7 @@ QPushButton#primary { color: white; background: #216cdb; border-color: #216cdb; 
 QPushButton#primary:hover { background: #195fc5; }
 QPushButton#primary:disabled { color: #e7edf6; background: #a5bddf; border-color: #a5bddf; }
 QPushButton#autoButton { padding: 3px 10px; font-size: 11px; }
+QPushButton#zoomReset { padding: 4px 10px; font-size: 12px; }
 QGroupBox { background: white; border: 1px solid #dfe5ed; border-radius: 10px;
             margin-top: 15px; padding: 16px 14px 14px; font-weight: 600; }
 QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 5px;
@@ -56,6 +58,28 @@ QFrame#previewFrame { background: #10151d; border: 1px solid #dfe5ed; border-rad
 QLabel#errorBanner { background: #fff0e9; color: #963b20; padding: 10px 14px;
                      border: 1px solid #f0c9b8; border-radius: 7px; }
 """
+
+
+class ElidedLabel(QLabel):
+    """Keep footer messages on one line, with their full text in a tooltip."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setToolTip(text)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        text = self.fontMetrics().elidedText(
+            self.text(), Qt.TextElideMode.ElideRight, self.contentsRect().width()
+        )
+        painter.drawText(self.contentsRect(), self.alignment(), text)
 
 
 class ControlField(QWidget):
@@ -167,6 +191,7 @@ class MainWindow(QMainWindow):
         body = QHBoxLayout()
         body.setSpacing(18)
         preview_column = QVBoxLayout()
+        preview_column.setSpacing(8)
         preview_heading = QHBoxLayout()
         label = QLabel("LIVE COLOR PREVIEW")
         label.setObjectName("sectionTitle")
@@ -181,11 +206,64 @@ class MainWindow(QMainWindow):
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(1, 1, 1, 1)
         self.preview = PreviewWidget()
+        self.preview.setMinimumHeight(160)
         frame_layout.addWidget(self.preview)
         preview_column.addWidget(frame, 1)
+        footer = QVBoxLayout()
+        footer.setSpacing(3)
+        preview_column.addLayout(footer)
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"))
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(10, 80)
+        self.zoom_slider.setValue(10)
+        self.zoom_slider.setPageStep(10)
+        self.zoom_slider.setEnabled(False)
+        self.zoom_slider.setAccessibleName("Preview zoom")
+        self.zoom_slider.setToolTip("1× fits the full image; zoom up to 8× and drag to pan.")
+        self.zoom_slider.valueChanged.connect(lambda value: self.preview.set_zoom(value / 10))
+        zoom_row.addWidget(self.zoom_slider, 1)
+        self.zoom_label = QLabel("1.0×")
+        self.zoom_label.setMinimumWidth(42)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        zoom_row.addWidget(self.zoom_label)
+        self.zoom_reset_button = QPushButton("1×")
+        self.zoom_reset_button.setObjectName("zoomReset")
+        self.zoom_reset_button.setAccessibleName("Reset preview zoom to 1×")
+        self.zoom_reset_button.setToolTip("Reset zoom and center the full image")
+        self.zoom_reset_button.setEnabled(False)
+        self.zoom_reset_button.clicked.connect(self.preview.reset_zoom)
+        zoom_row.addWidget(self.zoom_reset_button)
+        self.preview.zoom_changed.connect(self._on_preview_zoom)
+        footer.addLayout(zoom_row)
+        info_row = QHBoxLayout()
+        info_row.setSpacing(6)
         self.frame_label = QLabel("Waiting for the first frame")
         self.frame_label.setObjectName("hint")
-        preview_column.addWidget(self.frame_label)
+        self.frame_label.setToolTip("Full image dimensions · RGB 8-bit · Received frame rate. Preview updates up to 30 fps.")
+        info_row.addWidget(self.frame_label)
+        info_row.addWidget(QLabel("|"))
+        self.pixel_info_label = QLabel("Hover over the image for x/y + RGB")
+        self.pixel_info_label.setObjectName("pixelReadout")
+        self.pixel_info_label.setAccessibleName("Preview pixel information")
+        self.pixel_info_label.setToolTip(
+            "Original image coordinates, starting at (0, 0) in the top-left. "
+            "RGB values use the displayed full-resolution color frame, from 0 to 255."
+        )
+        self.preview.pixel_info_changed.connect(self._on_preview_pixel_info)
+        info_row.addWidget(self.pixel_info_label)
+        info_row.addStretch()
+        footer.addLayout(info_row)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+        self.status_label = ElidedLabel("Ready to connect")
+        self.status_label.setObjectName("hint")
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(QLabel("|"))
+        self.zoom_hint = ElidedLabel("1× fits the image · Zoom in to pan")
+        self.zoom_hint.setObjectName("hint")
+        status_row.addWidget(self.zoom_hint, 1)
+        footer.addLayout(status_row)
         body.addLayout(preview_column, 1)
 
         scroll = QScrollArea()
@@ -263,10 +341,6 @@ class MainWindow(QMainWindow):
         body.addWidget(scroll)
         layout.addLayout(body, 1)
 
-        self.status_label = QLabel("Ready to connect")
-        self.status_label.setObjectName("subtitle")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
         action = QAction("Save image…", self)
         action.setShortcut(QKeySequence.StandardKey.Save)
         action.triggered.connect(self.save_image)
@@ -317,6 +391,8 @@ class MainWindow(QMainWindow):
         self.analysis_panel.clear()
         self.analysis_panel.set_live(False)
         self.preview.clear("Connecting to camera…")
+        self.zoom_slider.setEnabled(False)
+        self.zoom_reset_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.connection_button.setEnabled(False)
         self.connection_button.setText("Connecting…")
@@ -406,12 +482,14 @@ class MainWindow(QMainWindow):
         height, width, _ = rgb.shape
         image = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888)
         self.preview.set_image(image)
+        self.zoom_slider.setEnabled(True)
+        self.zoom_reset_button.setEnabled(True)
         self.analysis_panel.set_image_size(width, height)
         self.analysis_panel.set_live(True)
         self._update_profile_guide()
         self.live_badge.setText("● LIVE")
         self.frame_label.setText(
-            f"{width:,} × {height:,} px  ·  RGB 8-bit  ·  {frame.fps:.1f} fps received  ·  Preview up to 30 fps"
+            f"{width}×{height} · RGB8 · {frame.fps:.1f} fps"
         )
         self.save_button.setEnabled(True)
 
@@ -422,11 +500,37 @@ class MainWindow(QMainWindow):
             enabled=self.analysis_dock.isVisible() and self._frame is not None,
         )
 
+    def _on_preview_pixel_info(self, info):
+        if info is None:
+            self.pixel_info_label.setText("Hover over the image for x/y + RGB")
+            return
+        x, y, red, green, blue = info
+        self.pixel_info_label.setText(f"x {x}, y {y} · RGB {red}/{green}/{blue}")
+
+    def _on_preview_zoom(self, zoom):
+        blocker = QSignalBlocker(self.zoom_slider)
+        self.zoom_slider.setValue(round(zoom * 10))
+        del blocker
+        self.zoom_label.setText(f"{zoom:.1f}×")
+        self._update_zoom_hint()
+
+    def _update_zoom_hint(self):
+        if self.preview.zoom <= 1:
+            self.zoom_hint.setText("1× fits the image · Zoom in to pan")
+        elif self.analysis_dock.isVisible():
+            self.zoom_hint.setText("Drag to pan · Shift-drag selects profile")
+        else:
+            self.zoom_hint.setText("Drag to pan · 1× resets the view")
+
     def _analysis_visibility_changed(self, visible):
         blocker = QSignalBlocker(self.analysis_button)
         self.analysis_button.setChecked(visible)
         del blocker
         self._update_profile_guide()
+        self._update_zoom_hint()
+        # Keep the preview's coordinate viewport fully visible at small window
+        # sizes, including when the dock and its controls are shown.
+        self.setMinimumHeight(max(650, self.minimumSizeHint().height()))
         if visible:
             self._request_analysis()
 
@@ -505,7 +609,8 @@ class MainWindow(QMainWindow):
             self.preview.clear("Camera unavailable\n\nConnect a USB 3 camera, close SpinView, and click Connect camera.")
         else:
             self.live_badge.setText("LAST FRAME")
-            self.frame_label.setText(self.frame_label.text().split("  ·  ")[0] + "  ·  Last received frame")
+            height, width = self._frame.rgb.shape[:2]
+            self.frame_label.setText(f"{width}×{height} · RGB8 · Last frame")
         if not self.error_banner.isVisible():
             self.status_label.setText("Camera disconnected. You can reconnect at any time.")
         if self._closing:

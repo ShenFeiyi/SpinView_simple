@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 
 CHANNEL_COLORS = ("#c34242", "#1e8653", "#2468c5")
-PROFILE_HINT = "Click or drag on the preview to select a line; hover over the profile for RGB values."
+PROFILE_HINT = "Click to select a line (Shift-drag when zoomed); hover over the profile for RGB values."
 
 
 def _count_label(value: float) -> str:

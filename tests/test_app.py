@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, Signal
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -141,6 +142,113 @@ class AppTests(unittest.TestCase):
         self.window.connect_camera()
         self.window._on_analysis_result(result)
         self.assertIsNone(self.window.analysis_panel._result)
+
+    def test_preview_hover_readout_is_live_and_works_without_analysis(self):
+        rgb = np.arange(6 * 10 * 3, dtype=np.uint8).reshape(6, 10, 3)
+        rgb.setflags(write=False)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        self.window.analysis_button.click()
+        self.app.processEvents()
+        target = self.window.preview.image_rect()
+        point = QPointF(target.left() + 7.5 * target.width() / 10,
+                        target.top() + 2.5 * target.height() / 6)
+        event = QMouseEvent(QEvent.Type.MouseMove, point, point,
+                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(self.window.preview, event)
+        self.assertEqual(self.window.pixel_info_label.text(), "x 7, y 2 · RGB 81/82/83")
+        self.assertEqual((self.window.analysis_panel.row, self.window.analysis_panel.column), (3, 5))
+        updated = np.full_like(rgb, (200, 100, 50))
+        updated.setflags(write=False)
+        self.worker.frame = Frame(updated, 2, datetime.now(), 30.)
+        self.window._update_preview()
+        self.assertEqual(self.window.pixel_info_label.text(), "x 7, y 2 · RGB 200/100/50")
+        self.assertEqual(self.worker.writes, [])
+        self.worker.finish()
+        self.assertEqual(self.window.pixel_info_label.text(), "x 7, y 2 · RGB 200/100/50")
+        QApplication.sendEvent(self.window.preview, QEvent(QEvent.Type.Leave))
+        self.assertIn("Hover over the image", self.window.pixel_info_label.text())
+
+    def test_preview_pixel_readout_clears_on_reconnect(self):
+        rgb = np.full((4, 7, 3), (12, 34, 56), dtype=np.uint8)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        point = self.window.preview.image_rect().center()
+        event = QMouseEvent(QEvent.Type.MouseMove, point, point,
+                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(self.window.preview, event)
+        self.assertIn("RGB 12/34/56", self.window.pixel_info_label.text())
+        self.worker.finish()
+        self.worker.frame = None
+        self.window.connect_camera()
+        self.assertIn("Hover over the image", self.window.pixel_info_label.text())
+
+    def test_zoom_slider_pan_and_reset_preserve_full_image_and_profile_selection(self):
+        rgb = np.arange(16 * 32 * 3, dtype=np.uint16).astype(np.uint8).reshape(16, 32, 3)
+        rgb.setflags(write=False)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        self.app.processEvents()
+        preview = self.window.preview
+        fitted = preview.image_rect()
+        selected = (self.window.analysis_panel.row, self.window.analysis_panel.column)
+        self.window.zoom_slider.setValue(30)
+        self.assertEqual(preview.zoom, 3.0)
+        self.assertEqual(self.window.zoom_label.text(), "3.0×")
+        self.assertAlmostEqual(preview.image_rect().width(), fitted.width() * 3)
+        center = preview.viewport_rect().center()
+        destination = center + QPointF(70, 30)
+        for kind, point, button, buttons in (
+            (QEvent.Type.MouseButtonPress, center, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseMove, destination, Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseButtonRelease, destination, Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton),
+        ):
+            QApplication.sendEvent(preview, QMouseEvent(kind, point, point, button, buttons,
+                                                        Qt.KeyboardModifier.NoModifier))
+        self.assertNotEqual(preview.image_rect().center(), center)
+        self.assertEqual((self.window.analysis_panel.row, self.window.analysis_panel.column), selected)
+        self.assertIs(self.window._frame.rgb, rgb)
+        result = self.wait_for_analysis(*selected)
+        np.testing.assert_array_equal(result.histogram.sum(axis=1), [512, 512, 512])
+        np.testing.assert_array_equal(result.horizontal, rgb[selected[0]])
+        self.assertEqual(self.worker.writes, [])
+        self.window.zoom_reset_button.click()
+        self.assertEqual(preview.zoom, 1.0)
+        self.assertEqual(self.window.zoom_slider.value(), 10)
+        self.assertEqual(self.window.zoom_label.text(), "1.0×")
+        self.assertEqual(preview.image_rect(), fitted)
+
+    def test_zoom_remains_available_offline_and_resets_on_reconnect(self):
+        self.assertFalse(self.window.zoom_slider.isEnabled())
+        rgb = np.zeros((4, 7, 3), dtype=np.uint8)
+        self.worker.frame = Frame(rgb, 1, datetime.now(), 30.)
+        self.window._update_preview()
+        self.window.zoom_slider.setValue(40)
+        self.worker.finish()
+        self.assertTrue(self.window.zoom_slider.isEnabled())
+        self.assertTrue(self.window.zoom_reset_button.isEnabled())
+        self.assertEqual(self.window.preview.zoom, 4.0)
+        self.window.analysis_button.click()
+        self.assertEqual(self.window.preview.zoom, 4.0)
+        self.assertIn("Drag to pan", self.window.zoom_hint.text())
+        self.worker.frame = None
+        self.window.connect_camera()
+        self.assertEqual(self.window.preview.zoom, 1.0)
+        self.assertEqual(self.window.zoom_slider.value(), 10)
+        self.assertFalse(self.window.zoom_slider.isEnabled())
+        self.assertFalse(self.window.zoom_reset_button.isEnabled())
+
+    def test_small_window_keeps_the_entire_preview_viewport_visible(self):
+        self.window.resize(880, 650)
+        self.app.processEvents()
+        preview = self.window.preview
+        self.assertTrue(preview.parentWidget().contentsRect().contains(preview.geometry()))
+        self.window.analysis_button.click()
+        self.window.resize(880, 650)
+        self.app.processEvents()
+        self.assertTrue(preview.parentWidget().contentsRect().contains(preview.geometry()))
 
     def test_exposure_units_and_readback_do_not_echo_writes(self):
         self.assertEqual(self.window.controls["exposure_us"].spin.value(), 20.)
