@@ -8,8 +8,6 @@ histograms, and selectable horizontal or vertical RGB profiles.
 
 ![SpinView Simple camera-control interface](tests/GUI.png)
 
-*Earlier camera-control view; the current app also includes the image analysis panel.*
-
 ## Recent changes
 
 - Added full-resolution RGB histograms, optional logarithmic counts, and
